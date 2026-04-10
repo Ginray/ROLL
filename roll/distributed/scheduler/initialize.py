@@ -38,10 +38,17 @@ def start_ray_cluster():
 
     if rank == 0:
         cmd = f"ray start --head --port={master_port} --node-name={node_name} --dashboard-port={dashboard_port}"
+        if current_platform.is_npu():
+            npu_count = current_platform.device_count()
+            if npu_count > 0:
+                cmd += f" --resources='{{\"{current_platform.ray_device_key}\": {npu_count}}}'"
     else:
-        # fix: 处理大规模下可能会出现的head/worker node创建顺序不一致问题
         time.sleep(5)
         cmd = f"ray start --address={master_addr}:{master_port} --node-name={node_name} --dashboard-port={dashboard_port}"
+        if current_platform.is_npu():
+            npu_count = current_platform.device_count()
+            if npu_count > 0:
+                cmd += f" --resources='{{\"{current_platform.ray_device_key}\": {npu_count}}}'"
 
     logger.info(f"Starting ray cluster: {cmd}")
     ret = subprocess.run(cmd, shell=True, capture_output=True)
@@ -64,6 +71,16 @@ def init():
     runtime_env = {
         "env_vars": current_platform.get_custom_env_vars(),
     }
+
+    try:
+        import transfer_queue
+        tq_path = os.path.dirname(os.path.dirname(transfer_queue.__file__))
+        if "py_modules" not in runtime_env:
+            runtime_env["py_modules"] = []
+        runtime_env["py_modules"].append(tq_path)
+        logger.info(f"Added TransferQueue path to Ray runtime_env: {tq_path}")
+    except ImportError:
+        pass
 
     if not ray.is_initialized():
         ray.init(

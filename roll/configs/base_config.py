@@ -320,7 +320,9 @@ class BaseConfig(ScheduleConfig):
         os.environ.update(self.system_envs)
 
         from ..platforms import current_platform
-        self.num_gpus_per_node = current_platform.device_count()
+        detected_device_count = current_platform.device_count()
+        if detected_device_count > 0:
+            self.num_gpus_per_node = detected_device_count
 
         if hasattr(self, 'actor_train') and isinstance(self.actor_train, WorkerConfig):
             self.actor_train.system_envs.update({k: v for k, v in self.system_envs.items() if k not in self.actor_train.system_envs})

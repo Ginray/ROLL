@@ -1,6 +1,7 @@
 from collections import defaultdict
 from contextlib import nullcontext
 from datetime import timedelta
+import os
 from typing import Callable, Dict, Tuple
 
 import deepspeed
@@ -59,6 +60,19 @@ class DeepSpeedInferStrategy(InferenceStrategy):
 
         assert self.ds_config.is_zero3(), "deepspeed infer only supports zero = 3."
 
+        hccl_port = os.environ.get("HCCL_IF_BASE_PORT", "not set")
+        cluster_name = os.environ.get("CLUSTER_NAME", "unknown")
+        rank = os.environ.get("RANK", "not set")
+        world_size = os.environ.get("WORLD_SIZE", "not set")
+        master_addr = os.environ.get("MASTER_ADDR", "not set")
+        master_port = os.environ.get("MASTER_PORT", "not set")
+        logger.info(f"[DeepSpeedInferStrategy.initialize] cluster_name={cluster_name}, worker.cluster_name={self.worker.cluster_name}, RANK={rank}, WORLD_SIZE={world_size}, HCCL_IF_BASE_PORT={hccl_port}, MASTER_ADDR={master_addr}, MASTER_PORT={master_port}")
+        
+        import socket
+        hostname = socket.gethostname()
+        host_ip = socket.gethostbyname(hostname)
+        logger.info(f"[DeepSpeedInferStrategy.initialize] hostname={hostname}, host_ip={host_ip}")
+        
         deepspeed.init_distributed(timeout=timedelta(minutes=self.worker_config.backend_timeout))
         dist.all_reduce(torch.zeros(1).to(current_platform.device_type))
 
@@ -322,6 +336,19 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         assert self.ds_config._stage > 0, "deepspeed train only supports zero > 0."
 
         set_seed(seed=self.worker.pipeline_config.seed)
+        hccl_port = os.environ.get("HCCL_IF_BASE_PORT", "not set")
+        cluster_name = os.environ.get("CLUSTER_NAME", "unknown")
+        rank = os.environ.get("RANK", "not set")
+        world_size = os.environ.get("WORLD_SIZE", "not set")
+        master_addr = os.environ.get("MASTER_ADDR", "not set")
+        master_port = os.environ.get("MASTER_PORT", "not set")
+        logger.info(f"[DeepSpeedTrainStrategy.initialize] cluster_name={cluster_name}, worker.cluster_name={self.worker.cluster_name}, RANK={rank}, WORLD_SIZE={world_size}, HCCL_IF_BASE_PORT={hccl_port}, MASTER_ADDR={master_addr}, MASTER_PORT={master_port}")
+        
+        import socket
+        hostname = socket.gethostname()
+        host_ip = socket.gethostbyname(hostname)
+        logger.info(f"[DeepSpeedTrainStrategy.initialize] hostname={hostname}, host_ip={host_ip}")
+        
         deepspeed.init_distributed(timeout=timedelta(minutes=self.worker_config.backend_timeout))
         dist.all_reduce(torch.zeros(1).to(current_platform.device_type))
 

@@ -1,6 +1,7 @@
 from collections import defaultdict
 from concurrent import futures
 from datetime import timedelta
+import os
 from typing import Callable, Dict, List, Optional, Tuple
 
 import deepspeed
@@ -37,6 +38,9 @@ class HfInferStrategy(InferenceStrategy):
 
     def initialize(self, model_provider):
         set_seed(seed=self.worker.pipeline_config.seed)
+        hccl_port = os.environ.get("HCCL_IF_BASE_PORT", "not set")
+        cluster_name = os.environ.get("CLUSTER_NAME", "unknown")
+        logger.info(f"[HfInferStrategy.initialize] cluster_name={cluster_name}, worker.cluster_name={self.worker.cluster_name}, HCCL_IF_BASE_PORT={hccl_port}")
         dist.init_process_group(
             backend=current_platform.communication_backend,
             timeout=timedelta(minutes=self.worker_config.backend_timeout),

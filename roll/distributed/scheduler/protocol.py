@@ -5,10 +5,11 @@ We can subclass Protocol to define more detailed batch info with specific keys
 """
 
 import copy
+import io
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union, Set
+from typing import Any, Dict, List, Optional, Union, Set, TYPE_CHECKING
 
 import numpy as np
 import ray
@@ -27,6 +28,30 @@ try:
     tensordict.set_lazy_legacy(False).set()
 except:
     pass
+
+TQ_AVAILABLE = False
+try:
+    import transfer_queue as tq
+    from transfer_queue import BatchMeta, KVBatchMeta
+    TQ_AVAILABLE = True
+except ImportError:
+    BatchMeta = None
+    KVBatchMeta = None
+
+if TYPE_CHECKING:
+    try:
+        from transfer_queue import BatchMeta, KVBatchMeta
+    except ImportError:
+        BatchMeta = Any
+        KVBatchMeta = Any
+
+
+def _is_tq_enabled() -> bool:
+    return TQ_AVAILABLE and os.getenv("ROLL_ENABLE_TQ", "0") == "1"
+
+
+def _get_tq_partition_id() -> str:
+    return os.getenv("ROLL_TQ_PARTITION_ID", "default")
 
 
 def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
@@ -223,24 +248,152 @@ class DataProto:
             raise TypeError(f"Indexing with {type(item)} is not supported")
 
     def __getstate__(self):
-        import io
+        if _is_tq_enabled() and self.batch is not None and len(self) > 0:
+            return self._getstate_tq()
+        return self._getstate_pickle()
 
+    def _getstate_pickle(self):
         buffer = io.BytesIO()
         if tensordict.__version__ >= "0.5.0" and self.batch is not None:
             self.batch = self.batch.contiguous()
             self.batch = self.batch.consolidate()
         torch.save(self.batch, buffer)
-        return buffer, self.non_tensor_batch, self.meta_info
+        return ("pickle", buffer, self.non_tensor_batch, self.meta_info)
+
+    def _getstate_tq(self):
+        import time
+        t1 = time.time()
+        
+        tq.init()
+        tq_client = tq.get_client()
+        partition_id = _get_tq_partition_id()
+        batch_size = len(self)
+        
+        meta = tq_client.put(
+            data=self.batch,
+            metadata=BatchMeta(
+                global_indexes=list(range(batch_size)),
+                partition_ids=[partition_id] * batch_size,
+            )
+        )
+        
+        extra_info = {}
+        if self.non_tensor_batch:
+            extra_info["non_tensor_batch"] = copy.deepcopy(self.non_tensor_batch)
+        if self.meta_info:
+            extra_info["meta_info"] = copy.deepcopy(self.meta_info)
+        meta.extra_info = extra_info
+        
+        t2 = time.time()
+        logger.debug(f"DataProto serialized to TransferQueue, size={batch_size}, cost={t2-t1:.3f}s")
+        
+        return ("tq", meta)
 
     def __setstate__(self, data):
-        batch_deserialized, non_tensor_batch, meta_info = data
-        batch_deserialized.seek(0)
+        if isinstance(data, tuple) and len(data) >= 1:
+            if data[0] == "tq":
+                self._setstate_tq(data[1])
+                return
+            elif data[0] == "pickle":
+                self._setstate_pickle(data[1], data[2], data[3])
+                return
+        
+        self._setstate_pickle(data[0], data[1], data[2])
+
+    def _setstate_pickle(self, batch_buffer, non_tensor_batch, meta_info):
+        batch_buffer.seek(0)
         batch = torch.load(
-            batch_deserialized, weights_only=False, map_location="cpu" if not current_platform.is_available() else None
+            batch_buffer, weights_only=False, map_location="cpu" if not current_platform.is_available() else None
         )
         self.batch = batch
+        self.non_tensor_batch = non_tensor_batch if non_tensor_batch is not None else {}
+        self.meta_info = meta_info if meta_info is not None else {}
+
+    def _setstate_tq(self, meta: "BatchMeta"):
+        import time
+        t1 = time.time()
+        
+        tq_client = tq.get_client()
+        tensordict = tq_client.get_data(meta)
+        
+        extra_info = meta.extra_info or {}
+        non_tensor_batch = extra_info.get("non_tensor_batch", {})
+        meta_info = extra_info.get("meta_info", {})
+        
+        self.batch = tensordict
         self.non_tensor_batch = non_tensor_batch
         self.meta_info = meta_info
+        
+        t2 = time.time()
+        logger.debug(f"DataProto deserialized from TransferQueue, size={len(self)}, cost={t2-t1:.3f}s")
+
+    def to_tq_meta(self, partition_id: Optional[str] = None) -> Optional["BatchMeta"]:
+        """
+        Convert DataProto to TransferQueue BatchMeta for efficient transfer.
+        
+        Args:
+            partition_id: Optional partition ID for TransferQueue.
+                         If not provided, uses ROLL_TQ_PARTITION_ID env var or "default".
+        
+        Returns:
+            BatchMeta if TransferQueue is available and data is valid, None otherwise.
+        """
+        if not TQ_AVAILABLE:
+            logger.warning("TransferQueue is not available, cannot convert to BatchMeta")
+            return None
+        
+        if self.batch is None or len(self) == 0:
+            return None
+        
+        tq.init()
+        tq_client = tq.get_client()
+        partition_id = partition_id or _get_tq_partition_id()
+        batch_size = len(self)
+        
+        meta = tq_client.put(
+            data=self.batch,
+            metadata=BatchMeta(
+                global_indexes=list(range(batch_size)),
+                partition_ids=[partition_id] * batch_size,
+            )
+        )
+        
+        extra_info = {}
+        if self.non_tensor_batch:
+            extra_info["non_tensor_batch"] = copy.deepcopy(self.non_tensor_batch)
+        if self.meta_info:
+            extra_info["meta_info"] = copy.deepcopy(self.meta_info)
+        meta.extra_info = extra_info
+        
+        return meta
+
+    @classmethod
+    def from_tq_meta(cls, meta: "BatchMeta") -> "DataProto":
+        """
+        Create DataProto from TransferQueue BatchMeta.
+        
+        Args:
+            meta: BatchMeta from TransferQueue.
+        
+        Returns:
+            DataProto with data retrieved from TransferQueue.
+        """
+        if not TQ_AVAILABLE:
+            raise RuntimeError("TransferQueue is not available")
+        
+        tq_client = tq.get_client()
+        tensordict = tq_client.get_data(meta)
+        
+        extra_info = meta.extra_info or {}
+        non_tensor_batch = extra_info.get("non_tensor_batch", {})
+        meta_info = extra_info.get("meta_info", {})
+        
+        return cls(batch=tensordict, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
+
+    @property
+    def is_tq_backed(self) -> bool:
+        """Check if this DataProto is backed by TransferQueue data."""
+        return hasattr(self, '_tq_meta') and self._tq_meta is not None
 
     def check_consistency(self):
         """Check the consistency of the DataProto. Mainly for batch and non_tensor_batch
@@ -861,3 +1014,443 @@ class ObjectRefWrap:
     def __init__(self, obj_ref: ray.ObjectRef, collected=False):
         self.obj_ref = obj_ref
         self.collected = collected
+
+
+class LazyDataProto(DataProto):
+    """
+    A lazy-loading DataProto that integrates with TransferQueue for efficient data transfer.
+    
+    Key features:
+    1. Transparent TransferQueue integration - users don't need to change any code
+    2. Lazy loading - data is only loaded from TransferQueue when accessed
+    3. Automatic fallback to pickle serialization when TransferQueue is not available
+    4. 100% API compatible with DataProto
+    
+    Usage:
+        # Same as DataProto - no changes needed
+        data = LazyDataProto(batch=tensor_dict, non_tensor_batch=non_tensor, meta_info=meta)
+        
+        # When ROLL_ENABLE_TQ=1, serialization automatically uses TransferQueue
+        # Otherwise, falls back to pickle
+    """
+    
+    _tq_meta: "BatchMeta" = field(default=None, init=False)
+    _materialized: bool = field(default=True, init=False)
+    _batch: TensorDict = field(default=None, init=False)
+    
+    def __init__(
+        self,
+        batch: TensorDict = None,
+        non_tensor_batch: Dict = None,
+        meta_info: Dict = None,
+        _tq_meta: "BatchMeta" = None,
+    ):
+        self._tq_meta = _tq_meta
+        self._materialized = _tq_meta is None
+        self._batch = batch
+        
+        if non_tensor_batch is None:
+            non_tensor_batch = {}
+        if meta_info is None:
+            meta_info = {}
+        
+        object.__setattr__(self, 'non_tensor_batch', non_tensor_batch)
+        object.__setattr__(self, 'meta_info', meta_info)
+    
+    def __post_init__(self):
+        if self._materialized and self._batch is not None:
+            if current_platform.is_npu():
+                for key, val in self._batch.items():
+                    if isinstance(val, torch.Tensor) and val.dtype == torch.int64:
+                        logger.debug(f"[NPU] Converting Tensor {key} from int64 -> int32, shape={val.shape}")
+                        self._batch[key] = val.to(torch.int32)
+    
+    def _materialize(self):
+        """Load data from TransferQueue if not already materialized."""
+        if self._materialized or self._tq_meta is None:
+            return
+        
+        if not TQ_AVAILABLE:
+            raise RuntimeError("TransferQueue is not available but _tq_meta is set")
+        
+        import time
+        t1 = time.time()
+        
+        tq_client = tq.get_client()
+        tensordict = tq_client.get_data(self._tq_meta)
+        
+        extra_info = self._tq_meta.extra_info or {}
+        
+        self._batch = tensordict
+        if "non_tensor_batch" in extra_info:
+            object.__setattr__(self, 'non_tensor_batch', extra_info["non_tensor_batch"])
+        if "meta_info" in extra_info:
+            object.__setattr__(self, 'meta_info', extra_info["meta_info"])
+        
+        self._materialized = True
+        self._tq_meta = None
+        
+        t2 = time.time()
+        logger.debug(f"LazyDataProto materialized, size={len(self)}, cost={t2-t1:.3f}s")
+    
+    def __len__(self):
+        if self._tq_meta is not None and not self._materialized:
+            return self._tq_meta.size
+        if self._batch is not None:
+            return self._batch.batch_size[0]
+        if self.non_tensor_batch is not None and len(self.non_tensor_batch) > 0:
+            return len(next(iter(self.non_tensor_batch.values())))
+        return 0
+    
+    def __getitem__(self, item):
+        self._materialize()
+        if isinstance(item, slice):
+            return self.slice(item.start, item.stop, item.step)
+        if isinstance(item, (list, np.ndarray, torch.Tensor)):
+            return self.select_idxs(item)
+        if isinstance(item, int):
+            return self._get_single_item(item)
+        raise TypeError(f"Invalid index type: {type(item)}")
+    
+    def _get_single_item(self, idx: int):
+        self._materialize()
+        batch_item = self._batch[idx] if self._batch is not None else None
+        non_tensor_item = {k: v[idx] for k, v in self.non_tensor_batch.items()}
+        return DataProtoItem(batch=batch_item, non_tensor_batch=non_tensor_item, meta_info=self.meta_info)
+    
+    @property
+    def batch(self):
+        self._materialize()
+        return self._batch
+    
+    @batch.setter
+    def batch(self, value):
+        self._batch = value
+        self._materialized = True
+    
+    @property
+    def is_materialized(self) -> bool:
+        """Check if data has been loaded from TransferQueue."""
+        return self._materialized
+    
+    @property
+    def is_lazy(self) -> bool:
+        """Check if this LazyDataProto is still in lazy mode (not materialized)."""
+        return self._tq_meta is not None and not self._materialized
+    
+    def __getstate__(self):
+        if self._tq_meta is not None and not self._materialized:
+            return ("lazy_tq", self._tq_meta, self.non_tensor_batch, self.meta_info)
+        
+        if _is_tq_enabled() and self._batch is not None and len(self) > 0:
+            return self._getstate_tq()
+        return self._getstate_pickle()
+    
+    def _getstate_pickle(self):
+        buffer = io.BytesIO()
+        if tensordict.__version__ >= "0.5.0" and self._batch is not None:
+            self._batch = self._batch.contiguous()
+            self._batch = self._batch.consolidate()
+        torch.save(self._batch, buffer)
+        return ("pickle", buffer, self.non_tensor_batch, self.meta_info)
+    
+    def _getstate_tq(self):
+        import time
+        t1 = time.time()
+        
+        tq.init()
+        tq_client = tq.get_client()
+        partition_id = _get_tq_partition_id()
+        batch_size = len(self)
+        
+        meta = tq_client.put(
+            data=self._batch,
+            metadata=BatchMeta(
+                global_indexes=list(range(batch_size)),
+                partition_ids=[partition_id] * batch_size,
+            )
+        )
+        
+        extra_info = {}
+        if self.non_tensor_batch:
+            extra_info["non_tensor_batch"] = copy.deepcopy(self.non_tensor_batch)
+        if self.meta_info:
+            extra_info["meta_info"] = copy.deepcopy(self.meta_info)
+        meta.extra_info = extra_info
+        
+        t2 = time.time()
+        logger.debug(f"LazyDataProto serialized to TransferQueue, size={batch_size}, cost={t2-t1:.3f}s")
+        
+        return ("tq", meta)
+    
+    def __setstate__(self, data):
+        if isinstance(data, tuple) and len(data) >= 1:
+            if data[0] == "lazy_tq":
+                self._tq_meta = data[1]
+                self._materialized = False
+                self._batch = None
+                self.non_tensor_batch = data[2] if len(data) > 2 else {}
+                self.meta_info = data[3] if len(data) > 3 else {}
+                return
+            elif data[0] == "tq":
+                self._tq_meta = data[1]
+                self._materialized = False
+                self._batch = None
+                self.non_tensor_batch = {}
+                self.meta_info = {}
+                return
+            elif data[0] == "pickle":
+                self._setstate_pickle(data[1], data[2], data[3])
+                return
+        
+        self._setstate_pickle(data[0], data[1], data[2])
+    
+    def _setstate_pickle(self, batch_buffer, non_tensor_batch, meta_info):
+        batch_buffer.seek(0)
+        batch = torch.load(
+            batch_buffer, weights_only=False, map_location="cpu" if not current_platform.is_available() else None
+        )
+        self._batch = batch
+        self.non_tensor_batch = non_tensor_batch if non_tensor_batch is not None else {}
+        self.meta_info = meta_info if meta_info is not None else {}
+        self._tq_meta = None
+        self._materialized = True
+    
+    def materialize(self) -> "LazyDataProto":
+        """Force materialization and return self for chaining."""
+        self._materialize()
+        return self
+    
+    def to_dataproto(self) -> DataProto:
+        """Convert to a regular DataProto (forces materialization)."""
+        self._materialize()
+        return DataProto(
+            batch=self._batch,
+            non_tensor_batch=copy.deepcopy(self.non_tensor_batch),
+            meta_info=copy.deepcopy(self.meta_info),
+        )
+    
+    @classmethod
+    def from_dataproto(cls, data: DataProto) -> "LazyDataProto":
+        """Create a LazyDataProto from a DataProto."""
+        return cls(
+            batch=data.batch,
+            non_tensor_batch=copy.deepcopy(data.non_tensor_batch),
+            meta_info=copy.deepcopy(data.meta_info),
+        )
+    
+    @classmethod
+    def from_tq_meta(cls, meta: "BatchMeta") -> "LazyDataProto":
+        """Create a lazy LazyDataProto from TransferQueue BatchMeta (no data loading)."""
+        extra_info = meta.extra_info or {}
+        return cls(
+            batch=None,
+            non_tensor_batch=extra_info.get("non_tensor_batch", {}),
+            meta_info=extra_info.get("meta_info", {}),
+            _tq_meta=meta,
+        )
+    
+    def to_tq_meta(self, partition_id: Optional[str] = None) -> Optional["BatchMeta"]:
+        """Convert to TransferQueue BatchMeta for efficient transfer."""
+        if self._tq_meta is not None and not self._materialized:
+            return self._tq_meta
+        
+        if not TQ_AVAILABLE:
+            logger.warning("TransferQueue is not available")
+            return None
+        
+        if self._batch is None or len(self) == 0:
+            return None
+        
+        tq.init()
+        tq_client = tq.get_client()
+        partition_id = partition_id or _get_tq_partition_id()
+        batch_size = len(self)
+        
+        meta = tq_client.put(
+            data=self._batch,
+            metadata=BatchMeta(
+                global_indexes=list(range(batch_size)),
+                partition_ids=[partition_id] * batch_size,
+            )
+        )
+        
+        extra_info = {}
+        if self.non_tensor_batch:
+            extra_info["non_tensor_batch"] = copy.deepcopy(self.non_tensor_batch)
+        if self.meta_info:
+            extra_info["meta_info"] = copy.deepcopy(self.meta_info)
+        meta.extra_info = extra_info
+        
+        return meta
+    
+    def to(self, device) -> "LazyDataProto":
+        self._materialize()
+        if self._batch is not None:
+            self._batch = self._batch.to(device)
+        if self.meta_info is not None:
+            self.meta_info = move_tensors_to_device(self.meta_info, device)
+        return self
+    
+    def clone(self) -> "LazyDataProto":
+        self._materialize()
+        batch_copy = self._batch.clone() if self._batch is not None else None
+        non_tensor_copy = {k: np.copy(v) for k, v in self.non_tensor_batch.items()}
+        meta_copy = copy.deepcopy(self.meta_info)
+        return LazyDataProto(
+            batch=batch_copy,
+            non_tensor_batch=non_tensor_copy,
+            meta_info=meta_copy,
+        )
+    
+    def select(self, batch_keys=None, non_tensor_batch_keys=None, meta_info_keys=None, deepcopy=False) -> "LazyDataProto":
+        self._materialize()
+        
+        if batch_keys is not None:
+            batch_keys = tuple(batch_keys)
+            sub_batch = self._batch.select(*batch_keys)
+        else:
+            sub_batch = self._batch
+        
+        if non_tensor_batch_keys is not None:
+            non_tensor_batch = {k: v for k, v in self.non_tensor_batch.items() if k in non_tensor_batch_keys}
+        else:
+            non_tensor_batch = self.non_tensor_batch
+        
+        if deepcopy:
+            non_tensor_batch = copy.deepcopy(non_tensor_batch)
+        
+        if meta_info_keys is not None:
+            sub_meta_info = {k: v for k, v in self.meta_info.items() if k in meta_info_keys}
+        else:
+            sub_meta_info = self.meta_info
+        
+        if deepcopy:
+            sub_meta_info = copy.deepcopy(sub_meta_info)
+        
+        return LazyDataProto(batch=sub_batch, non_tensor_batch=non_tensor_batch, meta_info=sub_meta_info)
+    
+    def select_idxs(self, idxs) -> "LazyDataProto":
+        self._materialize()
+        
+        if isinstance(idxs, list):
+            idxs = torch.tensor(idxs)
+            if idxs.dtype != torch.bool:
+                idxs = idxs.type(torch.int32)
+        
+        if isinstance(idxs, np.ndarray):
+            idxs_np = idxs
+            idxs_torch = torch.from_numpy(idxs)
+        else:
+            idxs_torch = idxs
+            idxs_np = idxs.detach().cpu().numpy()
+        
+        batch_size = idxs_np.sum() if idxs_np.dtype == bool else idxs_np.shape[0]
+        
+        if self._batch is not None:
+            selected_batch = TensorDict(
+                source={k: t[idxs_torch] for k, t in self._batch.items()},
+                batch_size=(batch_size,),
+            )
+        else:
+            selected_batch = None
+        
+        selected_non_tensor = {k: v[idxs_np] for k, v in self.non_tensor_batch.items()}
+        
+        return LazyDataProto(batch=selected_batch, non_tensor_batch=selected_non_tensor, meta_info=self.meta_info)
+    
+    def slice(self, start=None, end=None, step=None) -> "LazyDataProto":
+        self._materialize()
+        slice_obj = slice(start, end, step)
+        
+        if self._batch is not None:
+            sliced_batch = self._batch[slice_obj]
+        else:
+            sliced_batch = None
+        
+        sliced_non_tensor = {k: v[slice_obj] for k, v in self.non_tensor_batch.items()}
+        
+        return LazyDataProto(batch=sliced_batch, non_tensor_batch=sliced_non_tensor, meta_info=self.meta_info)
+    
+    def chunk(self, chunks: int) -> List["LazyDataProto"]:
+        self._materialize()
+        
+        chunks_sizes = None
+        if len(self) > 0:
+            assert len(self) >= chunks, f"batch_size {len(self)} < chunks {chunks}"
+            index_array = np.arange(len(self))
+            chunks_sizes = [len(b) for b in np.array_split(index_array, chunks)]
+        
+        if self._batch is not None:
+            batch_lst = divide_by_chunk_size(self._batch, chunk_sizes=chunks_sizes)
+        else:
+            batch_lst = [None for _ in range(chunks)]
+        
+        non_tensor_batch_lst = [{} for _ in range(chunks)]
+        for key, val in self.non_tensor_batch.items():
+            non_tensor_lst = divide_by_chunk_size(val, chunk_sizes=chunks_sizes)
+            for i in range(chunks):
+                non_tensor_batch_lst[i][key] = non_tensor_lst[i]
+        
+        output = []
+        for i in range(chunks):
+            output.append(
+                LazyDataProto(
+                    batch=batch_lst[i].clone() if batch_lst[i] is not None else batch_lst[i],
+                    non_tensor_batch=non_tensor_batch_lst[i],
+                    meta_info=self.meta_info,
+                )
+            )
+        
+        return output
+    
+    @staticmethod
+    def concat(
+        data: List["LazyDataProto"],
+        *,
+        global_keys: Optional[Set[str]] = None,
+    ) -> "LazyDataProto":
+        global_keys = global_keys if global_keys is not None else {"metrics"}
+        
+        for d in data:
+            d._materialize()
+        
+        batch_lst = [d._batch for d in data if d._batch is not None]
+        new_batch = torch.cat(batch_lst, dim=0) if batch_lst else None
+        
+        non_tensor_batch = list_of_dict_to_dict_of_list([d.non_tensor_batch for d in data])
+        for k, v in non_tensor_batch.items():
+            non_tensor_batch[k] = custom_np_concatenate(v)
+        
+        merged_meta = dict(data[0].meta_info)
+        
+        for key in global_keys:
+            if key not in merged_meta:
+                continue
+            values = [d.meta_info.get(key) for d in data]
+            
+            if isinstance(merged_meta[key], dict):
+                sub_dict = list_of_dict_to_dict_of_list(values)
+                for sub_key, sub_list in sub_dict.items():
+                    try:
+                        if np.isscalar(sub_list[0]):
+                            sub_dict[sub_key] = np.array(sub_list).tolist()
+                        else:
+                            sub_dict[sub_key] = np.concatenate(sub_list, axis=0).tolist()
+                    except Exception:
+                        sub_dict[sub_key] = sub_list
+                merged_meta[key] = sub_dict
+            else:
+                merged_meta[key] = values
+        
+        return LazyDataProto(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta)
+    
+    @classmethod
+    def from_dict(cls, tensors: Dict[str, torch.Tensor], non_tensors=None, meta_info=None, num_batch_dims=1) -> "LazyDataProto":
+        dp = DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta_info, num_batch_dims=num_batch_dims)
+        return cls.from_dataproto(dp)
+    
+    @classmethod
+    def from_single_dict(cls, data: Dict[str, Union[torch.Tensor, np.ndarray]], meta_info=None) -> "LazyDataProto":
+        dp = DataProto.from_single_dict(data=data, meta_info=meta_info)
+        return cls.from_dataproto(dp)

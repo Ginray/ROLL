@@ -8,13 +8,19 @@ import traceback
 from enum import Enum, auto
 from functools import wraps, partial
 from itertools import chain
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Union
 from more_itertools import chunked
 import ray
 import torch
 import asyncio
 
 from roll.distributed.scheduler.protocol import DataProto, ObjectRefWrap
+from roll.distributed.scheduler.transfer_queue import (
+    is_tq_enabled,
+    is_tq_available,
+    tqbridge as _tqbridge,
+    init_transfer_queue,
+)
 from roll.utils.logging import get_logger
 from roll.platforms import current_platform
 
@@ -261,13 +267,32 @@ def _check_execute_mode(execute_mode):
     assert isinstance(execute_mode, Execute), f"execute_mode must be a Execute. Got {execute_mode}"
 
 
-def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, clear_cache=True):
+def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, clear_cache=True, enable_tq=False):
+    """
+    Decorator for registering worker methods with dispatch and execute modes.
+
+    Args:
+        dispatch_mode: Controls how input data is distributed across workers.
+        execute_mode: Controls which workers execute the method.
+        clear_cache: Whether to clear GPU cache after execution.
+        enable_tq: Whether to enable TransferQueue bridging for this method.
+                   When True and TransferQueue is available, automatically handles
+                   conversion between BatchMeta and DataProto.
+    """
     _check_dispatch_mode(dispatch_mode)
     _check_execute_mode(execute_mode)
 
     def decorator(func):
         is_async = asyncio.iscoroutinefunction(func)
-        attrs = {"dispatch_mode": dispatch_mode, "execute_mode": execute_mode}
+        attrs = {
+            "dispatch_mode": dispatch_mode,
+            "execute_mode": execute_mode,
+            "enable_tq": enable_tq,
+        }
+
+        if enable_tq and is_tq_available():
+            func = _tqbridge(dispatch_mode)(func)
+
         if is_async:
             @wraps(func)
             async def inner_async(*args, **kwargs):
